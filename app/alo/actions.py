@@ -1,6 +1,7 @@
 """Actions module for interacting with alo.bg website."""
 
 import logging
+import re
 from typing import List, Dict, Optional, Tuple
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
@@ -17,12 +18,40 @@ PAYMENT_MARKERS = (
 DIALOG_CONTAINER_SELECTOR = "[role=dialog], .modal, [class*=modal], [class*=dialog]"
 
 
+# Short markers must stand alone (not inside other words), e.g. "топ" vs "топло"
+_SHORT_MARKERS = ("лв", "eur", "sms", "vip", "топ")
+_SHORT_MARKER_RE = re.compile(
+    r"(?<![^\W\d_])(?:" + "|".join(_SHORT_MARKERS) + r")(?![^\W\d_])"
+)
+_ALREADY_UPDATED_PHRASES = (
+    "обновявана или публикувана днес",
+    "обновявана днес",
+    "публикувана днес",
+)
+
+
 def is_payment_text(text: Optional[str]) -> bool:
     """Return True if the text contains any marker of a paid dialog."""
     if not text:
         return False
     lowered = text.lower()
-    return any(marker in lowered for marker in PAYMENT_MARKERS)
+    if _SHORT_MARKER_RE.search(lowered):
+        return True
+    return any(
+        marker in lowered for marker in PAYMENT_MARKERS if marker not in _SHORT_MARKERS
+    )
+
+
+def classify_dialog_text(text: Optional[str]) -> str:
+    """Classify dialog text: 'already_updated' | 'payment' | 'other' | 'none'."""
+    if not text or not text.strip():
+        return "none"
+    lowered = text.lower()
+    if any(phrase in lowered for phrase in _ALREADY_UPDATED_PHRASES):
+        return "already_updated"
+    if is_payment_text(text):
+        return "payment"
+    return "other"
 
 
 class AloActions:
@@ -60,8 +89,79 @@ class AloActions:
                 text = ""
         if is_payment_text(text):
             logger.warning(f"Payment-like dialog detected, not clicking: {(text or '')[:300]}")
+            await self._close_dialogs()
             return True
         return False
+
+    async def _read_visible_dialog_text(self, timeout_ms: int = 10000) -> Optional[str]:
+        """Poll for a visible dialog and return its text, or None on timeout. Never raises."""
+        try:
+            dialogs = self.page.locator(
+                '.ui-dialog:visible, [role="dialog"]:visible, .modal:visible'
+            )
+            waited = 0
+            while True:
+                try:
+                    if await dialogs.count() > 0:
+                        text = (await dialogs.first.inner_text()).strip()
+                        if text:
+                            return text
+                except Exception as e:
+                    logger.debug(f"Dialog poll error: {e}")
+                if waited >= timeout_ms:
+                    return None
+                await self.page.wait_for_timeout(500)
+                waited += 500
+        except Exception as e:
+            logger.debug(f"Could not read dialog text: {e}")
+            return None
+
+    async def _click_dialog_confirm(self) -> bool:
+        """Click the confirm button (Да/Потвърди/OK/ОК) of a visible dialog once. Never raises."""
+        try:
+            button = self.page.locator('.ui-dialog:visible button').filter(
+                has_text=re.compile(r"^\s*(Да|Потвърди|OK|ОК)\s*$", re.IGNORECASE)
+            ).first
+            if await button.count() > 0:
+                await button.click(timeout=3000)
+                logger.info("Clicked dialog confirm button")
+                return True
+        except Exception as e:
+            logger.debug(f"Could not click dialog confirm: {e}")
+        return False
+
+    async def _close_dialogs(self) -> None:
+        """Close visible jQuery UI dialogs and wait for the overlay to go away. Never raises."""
+        try:
+            for _ in range(3):
+                dialogs = self.page.locator('.ui-dialog:visible')
+                if await dialogs.count() == 0:
+                    break
+                try:
+                    button = self.page.locator('.ui-dialog:visible button').filter(
+                        has_text=re.compile(r"^\s*(OK|ОК|Close|Затвори)\s*$", re.IGNORECASE)
+                    ).first
+                    titlebar_close = self.page.locator('.ui-dialog-titlebar-close:visible').first
+                    if await button.count() > 0:
+                        await button.click(timeout=2000)
+                    elif await titlebar_close.count() > 0:
+                        await titlebar_close.click(timeout=2000)
+                    else:
+                        await self.page.keyboard.press("Escape")
+                except Exception as e:
+                    logger.debug(f"Dialog close attempt failed: {e}")
+                    try:
+                        await self.page.keyboard.press("Escape")
+                    except Exception:
+                        pass
+                try:
+                    await self.page.locator('.ui-widget-overlay').first.wait_for(
+                        state="hidden", timeout=3000
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"Closing dialogs failed: {e}")
 
     async def _save_unconfirmed_diagnostics(self) -> None:
         """Save screenshot, HTML and dialog text once per run. Never raises."""
@@ -85,16 +185,16 @@ class AloActions:
             except Exception as e:
                 logger.warning(f"Could not save diagnostic HTML: {e}")
             try:
-                elements = await self.page.query_selector_all(
-                    '[role="dialog"], .modal, [class*="modal"], [class*="dialog"]'
-                )
-                for el in elements:
+                dialogs = self.page.locator('.ui-dialog:visible')
+                seen = set()
+                for i in range(await dialogs.count()):
                     try:
-                        if await el.is_visible():
-                            text = (await el.inner_text()).strip()
-                            logger.warning(f"Visible dialog text: {text[:500]}")
+                        text = (await dialogs.nth(i).inner_text()).strip()
                     except Exception:
                         continue
+                    if text and text not in seen:
+                        seen.add(text)
+                        logger.warning(f"Visible dialog text: {text[:500]}")
             except Exception as e:
                 logger.warning(f"Could not read dialog text for diagnostics: {e}")
         except Exception as e:
@@ -650,6 +750,9 @@ class AloActions:
             if button_index is None:
                 return False, "Индекс кнопки не найден"
 
+            # Clear leftover dialogs/overlays from previous ads
+            await self._close_dialogs()
+
             # Find all buttons with text "Направи първа безплатна" and get the one at the specified index
             bump_buttons = await self.page.query_selector_all('button:has-text("Направи първа безплатна"), a:has-text("Направи първа безплатна")')
 
@@ -693,59 +796,35 @@ class AloActions:
                 except Exception as e2:
                     return False, f"Не удалось кликнуть кнопку: {str(e2)}"
 
-            # Wait a bit for page to react
-            await self.page.wait_for_timeout(2000)
+            # Wait for a visible site dialog (jQuery UI) and decide by its text
+            dialog_message = await self._read_visible_dialog_text(10000)
+            if dialog_message:
+                kind = classify_dialog_text(dialog_message)
+                logger.info(f"Site dialog: {dialog_message[:200]!r} -> {kind}")
+                if kind == "already_updated":
+                    await self._close_dialogs()
+                    return False, "already_updated_today"
+                if kind == "payment":
+                    logger.warning(f"Payment-like dialog, not clicking: {dialog_message[:300]}")
+                    await self._close_dialogs()
+                    return False, "payment_dialog"
 
-            # Check if dialog appeared with "already updated" message
-            dialog_message = None
-            try:
-                modal_selectors = [
-                    '.modal',
-                    '.dialog',
-                    '[class*="modal"]',
-                    '[class*="dialog"]',
-                    '[role="dialog"]'
-                ]
-
-                for modal_selector in modal_selectors:
-                    try:
-                        modal = await self.page.wait_for_selector(modal_selector, timeout=2000)
-                        if modal:
-                            dialog_text = await modal.inner_text()
-                            dialog_message = dialog_text.strip()
-                            logger.info(f"Found dialog with message: {dialog_message[:100]}")
-                            break
-                    except PlaywrightTimeoutError:
-                        continue
-            except Exception as e:
-                logger.debug(f"Could not read dialog message: {e}")
-
-            # If dialog says "already updated today", close it and return
-            if dialog_message and ("обновявана или публикувана днес" in dialog_message or
-                                  "обновявана днес" in dialog_message or
-                                  "публикувана днес" in dialog_message):
-                logger.info("Ad was already updated today, closing dialog...")
-                # Find and click OK/close button to dismiss the dialog
-                close_selectors = [
-                    'button:has-text("OK")',
-                    'button:has-text("ОК")',
-                    '.modal button',
-                    '.dialog button',
-                    '[class*="modal"] button'
-                ]
-
-                for selector in close_selectors:
-                    try:
-                        close_button = await self.page.wait_for_selector(selector, timeout=2000)
-                        if close_button and await close_button.is_visible():
-                            await close_button.click(timeout=3000)
-                            await self.page.wait_for_timeout(1000)
-                            logger.info("Dialog closed")
-                            break
-                    except (PlaywrightTimeoutError, Exception):
-                        continue
-
-                return False, "already_updated_today"
+                # Other dialog: click its confirm button once (payment check passed)
+                if await self._click_dialog_confirm():
+                    await self.page.wait_for_timeout(1000)
+                    follow_up = await self._read_visible_dialog_text(5000)
+                    if follow_up:
+                        follow_kind = classify_dialog_text(follow_up)
+                        logger.info(f"Site dialog (follow-up): {follow_up[:200]!r} -> {follow_kind}")
+                        if follow_kind == "already_updated":
+                            await self._close_dialogs()
+                            return False, "already_updated_today"
+                        if follow_kind == "payment":
+                            logger.warning(f"Payment-like dialog, not clicking: {follow_up[:300]}")
+                            await self._close_dialogs()
+                            return False, "payment_dialog"
+                await self._close_dialogs()
+                return True, f"Обновлено: {dialog_message[:80]}"
 
             # Re-find the button to check if it became disabled
             await self.page.wait_for_timeout(1000)  # Give page time to update
@@ -839,6 +918,7 @@ class AloActions:
             # Button is still active and no dialog was recognised: do NOT report success
             logger.warning("Button state unclear: button still present, bump not confirmed")
             await self._save_unconfirmed_diagnostics()
+            await self._close_dialogs()
             return False, "unconfirmed"
 
         except PlaywrightTimeoutError:
