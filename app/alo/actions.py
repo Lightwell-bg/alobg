@@ -8,6 +8,22 @@ from app.config import Config
 
 logger = logging.getLogger(__name__)
 
+# Markers (lower-case) of dialogs that look like paid services: never click inside them
+PAYMENT_MARKERS = (
+    "лв", "€", "eur", "евро", "плати", "плащане", "кредит",
+    "цена", "sms", "промо", "vip", "топ",
+)
+
+DIALOG_CONTAINER_SELECTOR = "[role=dialog], .modal, [class*=modal], [class*=dialog]"
+
+
+def is_payment_text(text: Optional[str]) -> bool:
+    """Return True if the text contains any marker of a paid dialog."""
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in PAYMENT_MARKERS)
+
 
 class AloActions:
     """Actions for interacting with alo.bg website."""
@@ -20,6 +36,69 @@ class AloActions:
             page: Playwright Page instance
         """
         self.page = page
+        self._diagnostics_saved = False
+
+    async def _is_payment_dialog(self, button) -> bool:
+        """
+        Check whether the dialog containing the button looks like a payment dialog.
+
+        Uses the closest dialog/modal container text, falling back to the button text.
+        """
+        text = ""
+        try:
+            text = await button.evaluate(
+                """el => {
+                    const c = el.closest('[role=dialog], .modal, [class*=modal], [class*=dialog]');
+                    return (c ? c.innerText : el.innerText) || '';
+                }"""
+            )
+        except Exception as e:
+            logger.debug(f"Could not read dialog container text: {e}")
+            try:
+                text = await button.inner_text()
+            except Exception:
+                text = ""
+        if is_payment_text(text):
+            logger.warning(f"Payment-like dialog detected, not clicking: {(text or '')[:300]}")
+            return True
+        return False
+
+    async def _save_unconfirmed_diagnostics(self) -> None:
+        """Save screenshot, HTML and dialog text once per run. Never raises."""
+        if self._diagnostics_saved:
+            return
+        self._diagnostics_saved = True
+        try:
+            from datetime import datetime
+            from pathlib import Path
+
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            logs_dir = Path("logs")
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                await self.page.screenshot(path=str(logs_dir / f"bump_unconfirmed_{ts}.png"), full_page=True)
+            except Exception as e:
+                logger.warning(f"Could not save diagnostic screenshot: {e}")
+            try:
+                html = await self.page.content()
+                (logs_dir / f"bump_unconfirmed_{ts}.html").write_text(html, encoding="utf-8")
+            except Exception as e:
+                logger.warning(f"Could not save diagnostic HTML: {e}")
+            try:
+                elements = await self.page.query_selector_all(
+                    '[role="dialog"], .modal, [class*="modal"], [class*="dialog"]'
+                )
+                for el in elements:
+                    try:
+                        if await el.is_visible():
+                            text = (await el.inner_text()).strip()
+                            logger.warning(f"Visible dialog text: {text[:500]}")
+                    except Exception:
+                        continue
+            except Exception as e:
+                logger.warning(f"Could not read dialog text for diagnostics: {e}")
+        except Exception as e:
+            logger.warning(f"Diagnostics failed: {e}")
 
     async def _handle_cookie_consent(self) -> None:
         """
@@ -698,6 +777,8 @@ class AloActions:
                                     try:
                                         conf_button = await self.page.wait_for_selector(selector, timeout=1000)
                                         if conf_button and await conf_button.is_visible():
+                                            if await self._is_payment_dialog(conf_button):
+                                                return False, "payment_dialog"
                                             await conf_button.click(timeout=2000)
                                             await self.page.wait_for_timeout(1000)
                                             logger.info("Closed confirmation dialog")
@@ -719,7 +800,6 @@ class AloActions:
                     'button:has-text("OK")',
                     'button:has-text("Да")',
                     'button:has-text("Потвърди")',
-                    'button:has-text("Направи")',
                     '.modal button:not([disabled])',
                     '.dialog button:not([disabled])'
                 ]
@@ -728,6 +808,8 @@ class AloActions:
                     try:
                         conf_button = await self.page.wait_for_selector(selector, timeout=2000)
                         if conf_button and await conf_button.is_visible():
+                            if await self._is_payment_dialog(conf_button):
+                                return False, "payment_dialog"
                             logger.info(f"Found confirmation dialog, clicking OK once...")
                             await conf_button.click(timeout=3000)
                             await self.page.wait_for_timeout(1500)
@@ -754,10 +836,10 @@ class AloActions:
             except Exception:
                 pass
 
-            # If we get here, button might still be active, but we've done our best
-            # Move to next ad anyway
-            logger.info("Button state unclear, but moving to next ad")
-            return True, "Обновлено"
+            # Button is still active and no dialog was recognised: do NOT report success
+            logger.warning("Button state unclear: button still present, bump not confirmed")
+            await self._save_unconfirmed_diagnostics()
+            return False, "unconfirmed"
 
         except PlaywrightTimeoutError:
             return False, "Таймаут при ожидании элементов"

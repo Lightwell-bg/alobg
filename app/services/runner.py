@@ -64,14 +64,34 @@ class AdBumpRunner:
             bumped_count = 0
             skipped_count = 0
             already_updated_count = 0
+            unconfirmed_count = 0
+            consecutive_unconfirmed = 0
 
-            # Process ads one by one, reloading the list after each successful bump
-            while ads:
+            # Hard cap protects against endless loops if the site changes
+            max_iterations = 2 * len(ads) + 5
+            iterations = 0
+            pos = 0
+            limit_exceeded = False
+
+            # Process ads by position. After a successful bump the list is reloaded;
+            # if it did not shrink, the button did not disappear, so move on.
+            while pos < len(ads):
+                iterations += 1
+                if iterations > max_iterations:
+                    limit_exceeded = True
+                    error_msg = (
+                        f"Остановлено: превышен лимит итераций ({max_iterations}), "
+                        f"похоже сайт изменился"
+                    )
+                    logger.error(error_msg)
+                    self._send_error_report(start_time, error_msg)
+                    break
+
                 processed_count += 1
-                ad = ads[0]  # Always process the first ad
+                ad = ads[pos]
                 title = ad.get("title", "Неизвестное объявление")
 
-                logger.info(f"Processing ad {processed_count}: {title}")
+                logger.info(f"Processing ad {processed_count} (position {pos}): {title}")
 
                 if ad.get("button_index") is None:
                     self.results.append({
@@ -79,11 +99,14 @@ class AdBumpRunner:
                         "status": "Ошибка: индекс кнопки не найден"
                     })
                     skipped_count += 1
-                    ads.pop(0)  # Remove processed ad
+                    pos += 1
                     continue
 
                 # Try to bump the ad
                 success, message = await self.alo_actions.bump_ad(ad)
+
+                if message != "unconfirmed":
+                    consecutive_unconfirmed = 0
 
                 if success:
                     bumped_count += 1
@@ -96,9 +119,13 @@ class AdBumpRunner:
                     # After successful bump, reload the page and get fresh list of ads
                     # This ensures we don't use stale elements
                     logger.info("Reloading page to get fresh list of ads...")
+                    prev_len = len(ads)
                     await self.page.wait_for_timeout(2000)  # Wait for page to update
                     ads = await self.alo_actions.get_active_ads()
                     logger.info(f"Found {len(ads)} remaining ads after reload")
+                    if len(ads) >= prev_len:
+                        # Button did not disappear: move to the next position
+                        pos += 1
                 elif message == "already_updated_today":
                     # Ad was already updated today, just skip it
                     already_updated_count += 1
@@ -107,7 +134,27 @@ class AdBumpRunner:
                         "status": "Уже обновлено сегодня"
                     })
                     logger.info(f"Ad '{title}' was already updated today, skipping")
-                    ads.pop(0)  # Remove processed ad, no need to reload
+                    pos += 1
+                elif message == "unconfirmed":
+                    unconfirmed_count += 1
+                    consecutive_unconfirmed += 1
+                    self.results.append({
+                        "title": title,
+                        "status": "Не подтверждено (кнопка осталась)"
+                    })
+                    logger.warning(f"Bump not confirmed for ad '{title}'")
+                    pos += 1
+                    if consecutive_unconfirmed >= 3:
+                        logger.error("3 ads in a row not confirmed, stopping (site likely changed)")
+                        break
+                elif message == "payment_dialog":
+                    skipped_count += 1
+                    self.results.append({
+                        "title": title,
+                        "status": "Пропущено: платный диалог, не нажато"
+                    })
+                    logger.warning(f"Payment dialog for ad '{title}', not clicked")
+                    pos += 1
                 else:
                     skipped_count += 1
                     self.results.append({
@@ -115,10 +162,13 @@ class AdBumpRunner:
                         "status": f"Пропущено: {message}"
                     })
                     logger.warning(f"Failed to bump ad '{title}': {message}")
-                    ads.pop(0)  # Remove failed ad from list
+                    pos += 1
 
                 # Small delay between ads
                 await self.page.wait_for_timeout(1000)
+
+            if limit_exceeded:
+                return
 
             # Check if all ads were already updated today
             if processed_count > 0 and bumped_count == 0 and already_updated_count == processed_count:
@@ -127,7 +177,10 @@ class AdBumpRunner:
                 return
 
             # Send report
-            self._send_report(start_time, processed_count, bumped_count, skipped_count, self.results, already_updated_count)
+            self._send_report(
+                start_time, processed_count, bumped_count, skipped_count,
+                self.results, already_updated_count, unconfirmed_count
+            )
 
         except Exception as e:
             logger.error(f"Error during ad bumping process: {e}", exc_info=True)
@@ -144,7 +197,8 @@ class AdBumpRunner:
         bumped_count: int,
         skipped_count: int,
         results: List[Dict[str, str]],
-        already_updated_count: int = 0
+        already_updated_count: int = 0,
+        unconfirmed_count: int = 0
     ) -> None:
         """
         Generate and send report to Telegram.
@@ -156,6 +210,7 @@ class AdBumpRunner:
             skipped_count: Number of ads skipped
             results: List of results for each ad
             already_updated_count: Number of ads already updated today
+            unconfirmed_count: Number of ads where the bump was not confirmed
         """
         end_time = get_sofia_time()
 
@@ -169,6 +224,9 @@ class AdBumpRunner:
 
         if already_updated_count > 0:
             report_lines.append(f"<b>Уже обновлено сегодня:</b> {already_updated_count}")
+
+        if unconfirmed_count > 0:
+            report_lines.append(f"<b>Не подтверждено:</b> {unconfirmed_count}")
 
         report_lines.extend([
             f"<b>Пропущено:</b> {skipped_count}",
@@ -186,6 +244,8 @@ class AdBumpRunner:
                     emoji = "✅"
                 elif "Уже обновлено" in status:
                     emoji = "ℹ️"
+                elif "Не подтверждено" in status:
+                    emoji = "⚠️"
                 elif "Пропущено" in status:
                     emoji = "⏭️"
                 else:

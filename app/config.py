@@ -27,6 +27,9 @@ class Config:
     # Browser settings
     BROWSER_HEADLESS: bool = os.getenv("BROWSER_HEADLESS", "true").lower() in ("true", "1", "yes")
 
+    # Global limit for one run, in minutes
+    MAX_RUN_MINUTES: int = int(os.getenv("MAX_RUN_MINUTES", "60"))
+
     @classmethod
     def validate(cls) -> None:
         """Validate that all required configuration values are set."""

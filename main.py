@@ -7,6 +7,7 @@ import logging
 from app.config import Config
 from app.logging_config import setup_logging
 from app.services.runner import AdBumpRunner
+from app.utils.time_utils import get_sofia_time
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,15 @@ async def main():
 
         # Create and run the ad bump runner
         runner = AdBumpRunner()
-        await runner.run()
+        start_time = get_sofia_time()
+        try:
+            # On timeout the runner's finally block closes the browser
+            await asyncio.wait_for(runner.run(), timeout=Config.MAX_RUN_MINUTES * 60)
+        except asyncio.TimeoutError:
+            error_msg = f"Превышен лимит времени выполнения ({Config.MAX_RUN_MINUTES} мин), скрипт остановлен"
+            logger.error(error_msg)
+            runner._send_error_report(start_time, error_msg)
+            sys.exit(1)
 
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
