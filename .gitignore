@@ -31,3 +31,6 @@ Thumbs.db
 
 # Playwright
 .playwright/
+
+# Local Claude usage meter
+.ojc-usage/

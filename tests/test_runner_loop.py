@@ -81,6 +81,41 @@ async def test_normal_case_all_bumped(monkeypatch):
     assert [r["status"] for r in runner.results] == ["Обновлено"] * 4
 
 
+async def test_four_disabled_one_active(monkeypatch):
+    async def get_ads():
+        return make_ads(5)
+
+    async def bump(ad):
+        if ad["button_index"] == 4:
+            return True, "Обновлено"
+        return False, "already_updated_today"
+
+    runner, actions = build_runner(monkeypatch, get_ads, bump)
+    await runner.run()
+
+    assert actions.bump_ad.await_count == 5
+    statuses = [r["status"] for r in runner.results]
+    assert statuses.count("Обновлено") == 1
+    assert statuses.count("Уже обновлено сегодня") == 4
+    report = runner.notifier.send_report.call_args[0][0]
+    assert "<b>Успешно поднято:</b> 1" in report
+
+
+async def test_all_disabled_sends_already_updated_report(monkeypatch):
+    async def get_ads():
+        return make_ads(3)
+
+    async def bump(ad):
+        return False, "already_updated_today"
+
+    runner, actions = build_runner(monkeypatch, get_ads, bump)
+    await runner.run()
+
+    assert actions.bump_ad.await_count == 3
+    report = runner.notifier.send_report.call_args[0][0]
+    assert "Все объявления уже обновлены" in report
+
+
 async def test_payment_dialog_skipped_not_bumped(monkeypatch):
     async def get_ads():
         return make_ads(2)

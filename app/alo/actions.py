@@ -42,6 +42,23 @@ def is_payment_text(text: Optional[str]) -> bool:
     )
 
 
+def parse_bump_button(href: Optional[str], class_name: Optional[str]) -> Tuple[Optional[str], bool]:
+    """
+    Parse a bump button's attributes.
+
+    Returns (ad_id from 'renewup(<id>)' or None, is_disabled), where disabled means
+    the class has 'myad-button-disabled' or href is 'javascript:dn()'.
+    """
+    href = (href or "").strip()
+    match = re.search(r"renewup\((\d+)\)", href)
+    ad_id = match.group(1) if match else None
+    disabled = (
+        "myad-button-disabled" in (class_name or "")
+        or re.fullmatch(r"javascript:dn\(\);?", href) is not None
+    )
+    return ad_id, disabled
+
+
 def classify_dialog_text(text: Optional[str]) -> str:
     """Classify dialog text: 'already_updated' | 'payment' | 'other' | 'none'."""
     if not text or not text.strip():
@@ -115,6 +132,22 @@ class AloActions:
         except Exception as e:
             logger.debug(f"Could not read dialog text: {e}")
             return None
+
+    async def _remove_consent_overlay(self) -> None:
+        """Remove the cookie consent overlay that can intercept clicks. Never raises."""
+        try:
+            await self.page.evaluate(
+                "document.querySelectorAll('.fc-consent-root').forEach(e => e.remove())"
+            )
+        except Exception as e:
+            logger.debug(f"Could not remove consent overlay: {e}")
+
+    async def _wait_loaded(self) -> None:
+        """Wait for domcontentloaded after a reload. Never raises."""
+        try:
+            await self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception as e:
+            logger.debug(f"wait_for_load_state failed: {e}")
 
     async def _click_dialog_confirm(self) -> bool:
         """Click the confirm button (Да/Потвърди/OK/ОК) of a visible dialog once. Never raises."""
@@ -671,57 +704,39 @@ class AloActions:
                 logger.info(f"Found {len(bump_buttons)} buttons with 'Направи първа безплатна' text")
 
                 for index, button in enumerate(bump_buttons):
+                    ad = {"title": f"Объявление {index + 1}", "button_index": index,
+                          "ad_id": None, "disabled": False}
                     try:
-                        # Get title from the button's context using JavaScript
-                        title = await button.evaluate("""
+                        info = await button.evaluate("""
                             (button) => {
-                                let parent = button.closest('div, tr, li, article');
-                                // Go up until we find a container that likely contains the ad
-                                while (parent && parent.parentElement) {
-                                    const text = parent.textContent || '';
-                                    // Check if this container has ad-like content
-                                    if (text.length > 50 && (
-                                        text.includes('обява') ||
-                                        text.includes('Активна') ||
-                                        text.includes('Преглеждания')
-                                    )) {
-                                        // Try to find title in this container
-                                        const titleEl = parent.querySelector('h1, h2, h3, h4, .title, a[href*="ad"]');
-                                        if (titleEl) {
-                                            return titleEl.textContent.trim().substring(0, 100);
-                                        }
-                                        // Extract first meaningful line
-                                        const lines = text.split('\\n');
-                                        for (const line of lines) {
-                                            const trimmed = line.trim();
-                                            if (trimmed.length > 10 && trimmed.length < 200) {
-                                                return trimmed;
-                                            }
-                                        }
-                                        return parent.textContent.trim().substring(0, 100);
+                                const wrapper = button.closest('.myad-btn-wrapper');
+                                const wid = wrapper && wrapper.id
+                                    ? wrapper.id.replace('myad-btn-wrapper-', '') : null;
+                                let title = null;
+                                if (wid) {
+                                    const row = document.getElementById('adrows_' + wid);
+                                    if (row) {
+                                        const h = row.querySelector('.listvip-item-title');
+                                        title = (h && h.textContent.trim()) || row.getAttribute('title');
                                     }
-                                    parent = parent.parentElement;
                                 }
-                                return 'Неизвестное объявление';
+                                return {
+                                    href: button.getAttribute('href'),
+                                    cls: button.getAttribute('class'),
+                                    wid: wid,
+                                    title: title
+                                };
                             }
                         """)
-
-                        if not title or title == 'Неизвестное объявление':
-                            title = f"Объявление {index + 1}"
-
-                        # Store index instead of ElementHandle
-                        ads.append({
-                            "title": title,
-                            "button_index": index
-                        })
+                        ad_id, disabled = parse_bump_button(info.get("href"), info.get("cls"))
+                        ad_id = ad_id or info.get("wid")
+                        ad["ad_id"] = ad_id
+                        ad["disabled"] = disabled
+                        title = (info.get("title") or "").strip()[:100]
+                        ad["title"] = title or (f"Обява {ad_id}" if ad_id else ad["title"])
                     except Exception as e:
                         logger.debug(f"Error processing ad container at index {index}: {e}")
-                        # Still add the ad with a generic title
-                        ads.append({
-                            "title": f"Объявление {index + 1}",
-                            "button_index": index
-                        })
-                        continue
+                    ads.append(ad)
 
             except Exception as e:
                 logger.warning(f"Error finding ads by button: {e}")
@@ -750,16 +765,32 @@ class AloActions:
             if button_index is None:
                 return False, "Индекс кнопки не найден"
 
-            # Clear leftover dialogs/overlays from previous ads
+            ad_id = ad_data.get('ad_id')
+
+            # Disabled button means "already updated today": never click it
+            if ad_data.get('disabled'):
+                logger.info(f"Bump button of ad {ad_id} is disabled, already updated today")
+                return False, "already_updated_today"
+
+            # Remove cookie consent overlay and leftover dialogs from previous ads
+            await self._remove_consent_overlay()
             await self._close_dialogs()
 
-            # Find all buttons with text "Направи първа безплатна" and get the one at the specified index
-            bump_buttons = await self.page.query_selector_all('button:has-text("Направи първа безплатна"), a:has-text("Направи първа безплатна")')
+            if ad_id:
+                # Locate the button by ad id (stable across list changes)
+                bump_button = await self.page.query_selector(
+                    f'a[href="javascript:renewup({ad_id})"]'
+                )
+                if bump_button is None:
+                    return False, f"Кнопка для обявы {ad_id} не найдена (возможно, уже обновлена)"
+            else:
+                # Fallback: find all buttons and take the one at the specified index
+                bump_buttons = await self.page.query_selector_all('button:has-text("Направи първа безплатна"), a:has-text("Направи първа безплатна")')
 
-            if button_index >= len(bump_buttons):
-                return False, f"Кнопка с индексом {button_index} не найдена (найдено {len(bump_buttons)} кнопок)"
+                if button_index >= len(bump_buttons):
+                    return False, f"Кнопка с индексом {button_index} не найдена (найдено {len(bump_buttons)} кнопок)"
 
-            bump_button = bump_buttons[button_index]
+                bump_button = bump_buttons[button_index]
 
             # Verify button is still attached and visible
             try:
@@ -786,18 +817,78 @@ class AloActions:
                 pass  # Continue if we can't check enabled state
 
             # Click the button once
-            logger.info(f"Clicking bump button 'Направи първа безплатна' (index {button_index})...")
-            try:
-                await bump_button.click(timeout=5000)
-            except Exception as e:
-                logger.warning(f"Normal click failed: {e}, trying force click")
-                try:
-                    await bump_button.click(force=True)
-                except Exception as e2:
-                    return False, f"Не удалось кликнуть кнопку: {str(e2)}"
+            logger.info(f"Clicking bump button 'Направи първа безплатна' (index {button_index}, ad {ad_id})...")
 
-            # Wait for a visible site dialog (jQuery UI) and decide by its text
-            dialog_message = await self._read_visible_dialog_text(10000)
+            # Native alert/confirm handler: must always accept or dismiss
+            native = {"msg": None}
+
+            async def on_dialog(dialog) -> None:
+                try:
+                    native["msg"] = dialog.message
+                    logger.info(f"Native dialog ({dialog.type}): {dialog.message[:200]!r}")
+                    if is_payment_text(dialog.message):
+                        await dialog.dismiss()
+                    else:
+                        await dialog.accept()
+                except Exception as e:
+                    logger.debug(f"Native dialog handler error: {e}")
+
+            self.page.on("dialog", on_dialog)
+            try:
+                try:
+                    await bump_button.click(timeout=5000)
+                except Exception as e:
+                    logger.warning(f"Normal click failed: {e}, trying force click")
+                    try:
+                        await bump_button.click(force=True)
+                    except Exception as e2:
+                        return False, f"Не удалось кликнуть кнопку: {str(e2)}"
+
+                # Wait up to 15 s: native message, jQuery dialog, or the renewup link gone
+                link_gone = False
+                waited = 0
+                while waited < 15000:
+                    if native["msg"] is not None:
+                        break
+                    try:
+                        if ad_id:
+                            if await self.page.locator(
+                                f'a[href="javascript:renewup({ad_id})"]'
+                            ).count() == 0:
+                                link_gone = True
+                                break
+                        if await self.page.locator('.ui-dialog:visible').count() > 0:
+                            break
+                    except Exception as e:
+                        logger.debug(f"Poll error (page may be reloading): {e}")
+                    await self.page.wait_for_timeout(500)
+                    waited += 500
+            finally:
+                try:
+                    self.page.remove_listener("dialog", on_dialog)
+                except Exception:
+                    pass
+
+            msg = native["msg"]
+            if msg is not None:
+                low = msg.lower()
+                if is_payment_text(msg):
+                    logger.warning(f"Payment-like native dialog dismissed: {msg[:300]}")
+                    await self._close_dialogs()
+                    return False, "payment_dialog"
+                if "днес" in low:
+                    await self._close_dialogs()
+                    return False, "already_updated_today"
+                if "обновена" in low:
+                    await self._wait_loaded()
+                    return True, "Обновлено"
+            elif link_gone:
+                logger.info("Bump link is gone after click - ad bumped")
+                await self._wait_loaded()
+                return True, "Обновлено"
+
+            # Look for a visible site dialog (jQuery UI) and decide by its text
+            dialog_message = await self._read_visible_dialog_text(3000)
             if dialog_message:
                 kind = classify_dialog_text(dialog_message)
                 logger.info(f"Site dialog: {dialog_message[:200]!r} -> {kind}")
