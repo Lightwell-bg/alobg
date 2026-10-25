@@ -5,7 +5,16 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.alo.actions import looks_logged_out
+from app.alo.actions import looks_logged_out, get_submit_selectors
+
+
+def test_submit_selectors_scoped_to_login_form():
+    selectors = get_submit_selectors()
+    assert selectors[0] == "#btn-login"
+    for sel in selectors:
+        assert sel.startswith("#") or sel.startswith("form:has(input[type=\"password\"])")
+    assert 'button[type="submit"]' not in selectors
+    assert 'input[type="submit"]' not in selectors
 from app.services.runner import AdBumpRunner
 
 

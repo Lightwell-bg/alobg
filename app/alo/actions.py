@@ -76,6 +76,18 @@ def looks_logged_out(url: Optional[str], has_visible_password: bool) -> bool:
     return "login.php" in (url or "").lower() and bool(has_visible_password)
 
 
+def get_submit_selectors() -> List[str]:
+    """Ordered login submit selectors, all scoped to the login form (never the search form)."""
+    return [
+        '#btn-login',
+        '#login_form button.auth-submit',
+        '#login_form button',
+        'form:has(input[type="password"]) button[type="submit"]',
+        'form:has(input[type="password"]) input[type="submit"]',
+        'form:has(input[type="password"]) button',
+    ]
+
+
 class AloActions:
     """Actions for interacting with alo.bg website."""
 
@@ -467,6 +479,7 @@ class AloActions:
 
             # Fill login form - expanded selectors
             email_selectors = [
+                '#username',
                 'input[type="email"]',
                 'input[name*="email"]',
                 'input[name*="login"]',
@@ -484,6 +497,7 @@ class AloActions:
             ]
 
             password_selectors = [
+                '#login-password',
                 'input[type="password"]',
                 'input[name*="password"]',
                 'input[name*="pass"]',
@@ -641,20 +655,10 @@ class AloActions:
             await self.page.wait_for_timeout(500)
 
             # Submit form
-            submit_selectors = [
-                'button[type="submit"]',
-                'input[type="submit"]',
-                'button:has-text("Вход")',
-                'button:has-text("Login")',
-                'button:has-text("Влез")',
-                'form button',
-                'form input[type="submit"]',
-                'button.btn-primary',
-                'button[class*="submit"]'
-            ]
-
+            # Only selectors scoped to the login form (the header search form
+            # also has a submit button and comes first in the DOM)
             submit_button = None
-            for selector in submit_selectors:
+            for selector in get_submit_selectors():
                 try:
                     submit_button = await self.page.wait_for_selector(selector, timeout=2000)
                     if submit_button:
@@ -663,22 +667,15 @@ class AloActions:
                 except PlaywrightTimeoutError:
                     continue
 
-            if not submit_button:
-                logger.error("Could not find submit button")
-                # Take screenshot for debugging
+            if submit_button:
                 try:
-                    await self.page.screenshot(path="logs/login_submit_error.png")
-                    logger.info("Screenshot saved to logs/login_submit_error.png")
-                except Exception:
-                    pass
-                return False
-
-            # Try to click submit button
-            try:
-                await submit_button.click(timeout=5000)
-            except Exception as e:
-                logger.warning(f"Normal submit click failed: {e}, trying force click")
-                await submit_button.click(force=True)
+                    await submit_button.click(timeout=5000)
+                except Exception as e:
+                    logger.warning(f"Normal submit click failed: {e}, trying force click")
+                    await submit_button.click(force=True)
+            else:
+                logger.warning("Login submit button not found, pressing Enter in the password field")
+                await password_input.press("Enter")
 
             # Use domcontentloaded instead of networkidle to avoid timeout issues
             try:
@@ -739,6 +736,21 @@ class AloActions:
                 except Exception:
                     pass
 
+            # The site may redirect to the homepage after a successful login:
+            # check that the my-ads page is accessible without the login form.
+            # Skipped when we are still on the login form (keeps its error text).
+            if not logged_out:
+                try:
+                    await self.page.goto(Config.ALO_MY_ADS_URL, wait_until="domcontentloaded", timeout=30000)
+                    await self.page.wait_for_timeout(2000)
+                    ads_url = self.page.url
+                    if "login.php" not in ads_url.lower() and not await self._has_visible_password():
+                        logger.info("Login successful - my ads page accessible")
+                        return True
+                except Exception as e:
+                    logger.warning(f"My ads page check failed: {e}")
+
+            current_url = self.page.url
             logger.warning(f"Login verification failed - current URL: {current_url}")
 
             # Save diagnostics and a human-readable reason
