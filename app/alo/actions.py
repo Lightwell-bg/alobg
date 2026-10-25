@@ -71,6 +71,11 @@ def classify_dialog_text(text: Optional[str]) -> str:
     return "other"
 
 
+def looks_logged_out(url: Optional[str], has_visible_password: bool) -> bool:
+    """Return True if the page is the login form: URL has login.php and a password input is visible."""
+    return "login.php" in (url or "").lower() and bool(has_visible_password)
+
+
 class AloActions:
     """Actions for interacting with alo.bg website."""
 
@@ -83,6 +88,76 @@ class AloActions:
         """
         self.page = page
         self._diagnostics_saved = False
+        self.last_login_failure: Optional[str] = None
+        self.last_ads_page_info: Optional[Dict[str, object]] = None
+
+    async def _has_visible_password(self) -> bool:
+        """Return True if a visible password input is on the page. Never raises."""
+        try:
+            return await self.page.locator('input[type="password"]:visible').count() > 0
+        except Exception as e:
+            logger.debug(f"Could not check password input: {e}")
+            return False
+
+    async def _safe_title(self) -> str:
+        """Return the page title or an empty string. Never raises."""
+        try:
+            return await self.page.title()
+        except Exception:
+            return ""
+
+    async def _collect_login_failure_reason(self) -> str:
+        """Build a human-readable login failure reason (URL, title, error text, captcha). Never raises."""
+        url = self.page.url
+        title = await self._safe_title()
+        error_text = ""
+        try:
+            loc = self.page.locator(
+                '[class*="error"]:visible, [class*="alert"]:visible, [class*="warning"]:visible'
+            )
+            parts = []
+            for i in range(min(await loc.count(), 5)):
+                try:
+                    t = " ".join((await loc.nth(i).inner_text()).split())
+                except Exception:
+                    continue
+                if t and t not in parts:
+                    parts.append(t)
+            error_text = " | ".join(parts)[:300]
+        except Exception as e:
+            logger.debug(f"Could not collect error text: {e}")
+        captcha = False
+        try:
+            captcha = await self.page.locator(
+                'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], '
+                'iframe[src*="turnstile"], .g-recaptcha'
+            ).count() > 0
+        except Exception as e:
+            logger.debug(f"Could not check captcha: {e}")
+        return (
+            f"URL: {url}; заголовок: {title}; "
+            f"текст ошибки: {error_text or 'нет'}; "
+            f"капча: {'да' if captcha else 'нет'}"
+        )
+
+    async def _save_page_diagnostics(self, name: str) -> None:
+        """Save logs/<name>.png and logs/<name>.html. Never raises."""
+        try:
+            from pathlib import Path
+
+            logs_dir = Path("logs")
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                await self.page.screenshot(path=str(logs_dir / f"{name}.png"), full_page=True)
+            except Exception as e:
+                logger.warning(f"Could not save screenshot {name}.png: {e}")
+            try:
+                html = await self.page.content()
+                (logs_dir / f"{name}.html").write_text(html, encoding="utf-8")
+            except Exception as e:
+                logger.warning(f"Could not save HTML {name}.html: {e}")
+        except Exception as e:
+            logger.warning(f"Could not save diagnostics {name}: {e}")
 
     async def _is_payment_dialog(self, button) -> bool:
         """
@@ -619,10 +694,14 @@ class AloActions:
                 'a[href*="user"]:has-text("Мои")',
                 '.user-menu',
                 '.logout',
-                '[class*="user"]'
             ]
 
-            for indicator in success_indicators:
+            current_url = self.page.url
+            logged_out = looks_logged_out(current_url, await self._has_visible_password())
+            if logged_out:
+                logger.warning(f"Still on the login form (URL: {current_url}), login failed")
+
+            for indicator in ([] if logged_out else success_indicators):
                 try:
                     await self.page.wait_for_selector(indicator, timeout=3000)
                     logger.info(f"Login successful - found indicator: {indicator}")
@@ -638,18 +717,16 @@ class AloActions:
             success_url_patterns = [
                 'user_edit_panel.php',
                 'user_online_ads.php',
-                'user_',
-                '/user/',
                 'edit_panel'
             ]
 
-            for pattern in success_url_patterns:
+            for pattern in ([] if logged_out else success_url_patterns):
                 if pattern.lower() in current_url.lower():
                     logger.info(f"Login successful - URL contains user panel indicator: {pattern}")
                     return True
 
             # Also check if URL changed from login page (indicates redirect after login)
-            if 'login.php' not in current_url.lower() and 'alo.bg' in current_url.lower():
+            if not logged_out and 'login.php' not in current_url.lower() and 'alo.bg' in current_url.lower():
                 logger.info("URL changed from login page - likely successful login")
                 # Wait a bit more for page to fully load
                 await self.page.wait_for_timeout(2000)
@@ -664,12 +741,10 @@ class AloActions:
 
             logger.warning(f"Login verification failed - current URL: {current_url}")
 
-            # Take screenshot for debugging
-            try:
-                await self.page.screenshot(path="logs/login_verification_failed.png")
-                logger.info("Screenshot saved to logs/login_verification_failed.png")
-            except Exception:
-                pass
+            # Save diagnostics and a human-readable reason
+            self.last_login_failure = await self._collect_login_failure_reason()
+            logger.warning(f"Login failure reason: {self.last_login_failure}")
+            await self._save_page_diagnostics("login_verification_failed")
 
             return False
 
@@ -691,6 +766,17 @@ class AloActions:
 
             # Wait for ads to load
             await self.page.wait_for_timeout(3000)
+
+            page_url = self.page.url
+            has_password = await self._has_visible_password()
+            logged_out = "login.php" in (page_url or "").lower() or has_password
+            if logged_out:
+                logger.warning(f"My-ads page looks logged out (URL: {page_url})")
+            self.last_ads_page_info = {
+                "url": page_url,
+                "title": await self._safe_title(),
+                "logged_out": logged_out,
+            }
 
             # Find all ad containers - look for containers that have the bump button
             # Each ad is likely in a container (div, tr, etc.) that contains the button "Направи първа безплатна"
@@ -740,6 +826,9 @@ class AloActions:
 
             except Exception as e:
                 logger.warning(f"Error finding ads by button: {e}")
+
+            if not ads:
+                await self._save_page_diagnostics("no_ads")
 
             logger.info(f"Found {len(ads)} active ads")
             return ads

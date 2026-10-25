@@ -1,5 +1,6 @@
 """Main runner service that orchestrates the ad bumping process."""
 
+import html
 import logging
 from typing import List, Dict, Optional
 from playwright.async_api import Page
@@ -45,6 +46,9 @@ class AdBumpRunner:
 
             if not login_success:
                 error_msg = "Не удалось выполнить вход на сайт"
+                reason = getattr(self.alo_actions, "last_login_failure", None)
+                if isinstance(reason, str) and reason:
+                    error_msg = f"{error_msg}. {reason}"
                 logger.error(error_msg)
                 self._send_error_report(start_time, error_msg)
                 return
@@ -54,7 +58,9 @@ class AdBumpRunner:
 
             if not ads:
                 logger.warning("No active ads found")
-                self._send_report(start_time, 0, 0, 0, [])
+                self._send_no_ads_alert(
+                    start_time, getattr(self.alo_actions, "last_ads_page_info", None)
+                )
                 return
 
             logger.info(f"Found {len(ads)} active ads to process")
@@ -284,6 +290,33 @@ class AdBumpRunner:
         report_text = "\n".join(report_lines)
         self.notifier.send_report(report_text)
 
+    def _send_no_ads_alert(self, start_time, page_info: Optional[dict]) -> None:
+        """
+        Send an alert when no ads were found on the my-ads page.
+
+        Args:
+            start_time: Start time of the process
+            page_info: Dict with url, title, logged_out (page-derived, untrusted) or None
+        """
+        info = page_info if isinstance(page_info, dict) else {}
+        report_lines = [
+            "<b>⚠️ Не найдено ни одного объявления</b>",
+            "",
+            f"<b>Дата и время:</b> {format_datetime(start_time)}",
+        ]
+        if info.get("url"):
+            report_lines.append(f"<b>Страница:</b> {html.escape(str(info['url']))}")
+        if info.get("title"):
+            report_lines.append(f"<b>Заголовок:</b> {html.escape(str(info['title']))}")
+        report_lines.append("")
+        if info.get("logged_out"):
+            report_lines.append("Похоже, бот не вошёл в аккаунт.")
+        else:
+            report_lines.append("Проверьте, есть ли активные объявления на сайте.")
+        report_lines.append("Скриншот сохранён в logs/no_ads.png")
+
+        self.notifier.send_report("\n".join(report_lines))
+
     def _send_error_report(self, start_time, error_message: str) -> None:
         """
         Send error report to Telegram.
@@ -296,7 +329,7 @@ class AdBumpRunner:
             "<b>❌ Ошибка при выполнении скрипта</b>",
             "",
             f"<b>Дата и время:</b> {format_datetime(start_time)}",
-            f"<b>Ошибка:</b> {error_message}",
+            f"<b>Ошибка:</b> {html.escape(str(error_message))}",
         ]
 
         report_text = "\n".join(report_lines)
